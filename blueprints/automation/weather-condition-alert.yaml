@@ -278,6 +278,49 @@ blueprint:
               filter:
                 - domain: input_number
 
+    indoor_temp_section:
+      name: 🌡️ Indoor temperature alert (optional)
+      icon: mdi:thermometer-alert
+      collapsed: true
+      description: >
+        Optionally alert when the forecast outdoor temperature is expected to
+        exceed your indoor temperature — useful for "close your windows before
+        it gets warmer outside than inside" reminders. When enabled, the alert
+        boolean and message will also activate if the outdoor temperature in
+        any forecast hour exceeds the selected indoor sensor's current value.
+      input:
+        enable_indoor_temp_alert:
+          name: Enable indoor temperature alert
+          description: >
+            When enabled, the automation will check if the outdoor temperature
+            in the forecast window is expected to exceed your indoor temperature
+            sensor and raise an alert if so.
+          default: false
+          selector:
+            boolean: {}
+
+        indoor_temp_entity:
+          name: Indoor temperature sensor
+          description: >
+            A temperature sensor representing your current indoor temperature.
+            When any forecast hour's outdoor temperature exceeds this value,
+            an alert is raised. Leave empty if the toggle above is off.
+          default: {}
+          selector:
+            entity:
+              multiple: false
+              filter:
+                - device_class: temperature
+
+        indoor_temp_message:
+          name: Indoor temperature alert message prefix
+          description: >
+            Message prefix used when outdoor temperature is expected to exceed
+            indoor temperature. The forecast time will be appended automatically.
+          default: "Close your windows! Outdoor temperature will exceed indoor around"
+          selector:
+            text: {}
+
     schedule_section:
       name: Check frequency
       icon: mdi:clock-outline
@@ -432,6 +475,9 @@ actions:
               notify_end_time: !input notify_end_time
               track_precip: !input track_precipitation
               precip_helper_entity: !input precipitation_helper
+              enable_temp_alert: !input enable_indoor_temp_alert
+              indoor_temp_entity_var: !input indoor_temp_entity
+              indoor_temp_message_prefix: !input indoor_temp_message
 
               merged: "{{ merge_response(forecasts) }}"
               hourly: >
@@ -456,12 +502,28 @@ actions:
               alert_current_state: >
                 {{ states(alert_boolean_entity) if alert_boolean_entity is not none else 'unknown' }}
 
+              indoor_temp: >
+                {% if enable_temp_alert and indoor_temp_entity_var is string %}
+                  {{ states(indoor_temp_entity_var) | float(none) }}
+                {% else %}
+                  {{ none }}
+                {% endif %}
+              temp_exceed_hours: >
+                {% if enable_temp_alert and indoor_temp is not none %}
+                  {{ hourly | selectattr('temperature', 'defined') | selectattr('temperature', 'gt', indoor_temp) | list }}
+                {% else %}
+                  {{ [] }}
+                {% endif %}
+              first_temp_exceed: "{{ temp_exceed_hours[0] if temp_exceed_hours | length > 0 else none }}"
+              temp_alert_active: "{{ enable_temp_alert and indoor_temp is not none and temp_exceed_hours | length > 0 }}"
+              weather_alert_active: "{{ (hourly | length > 0) and (matching_count | int >= min_matching_hours | int) }}"
+
           - choose:
-              # 1) Forecast data present AND enough matching hours → ACTIVATE alert
+              # 1) Forecast data present AND weather or temp alert is active → ACTIVATE alert
               - conditions:
                   - condition: template
                     value_template: >
-                      {{ (hourly | length > 0) and (matching_count | int >= min_matching_hours | int) }}
+                      {{ (hourly | length > 0) and (weather_alert_active or temp_alert_active) }}
                 sequence:
                   # Build the alert message text
                   - variables:
@@ -510,6 +572,23 @@ actions:
                         {% else %}
                           {{ '' }}
                         {% endif %}
+                      temp_alert_text: >-
+                        {% if temp_alert_active and first_temp_exceed %}
+                          {% set dt = as_datetime(first_temp_exceed.datetime) | as_local %}
+                          {% set time_str = dt.strftime('%-I:%M %p') %}
+                          {{ indoor_temp_message_prefix }} {{ time_str }}.
+                        {% else %}
+                          {{ '' }}
+                        {% endif %}
+                      combined_alert_message: >-
+                        {% set parts = [] %}
+                        {% if alert_message_text | trim %}
+                          {% set parts = parts + [alert_message_text | trim] %}
+                        {% endif %}
+                        {% if temp_alert_text | trim %}
+                          {% set parts = parts + [temp_alert_text | trim] %}
+                        {% endif %}
+                        {{ parts | join(' ') }}
 
                   # Turn on boolean and set message
                   - action: input_boolean.turn_on
@@ -520,7 +599,7 @@ actions:
                     target:
                       entity_id: !input alert_message
                     data:
-                      value: "{{ alert_message_text }}"
+                      value: "{{ combined_alert_message }}"
 
                   # Update precipitation helper if enabled
                   - if:
@@ -567,15 +646,15 @@ actions:
                         - action: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
                           data:
                             title: !input notification_title
-                            message: "{{ alert_message_text }}"
+                            message: "{{ combined_alert_message }}"
                           continue_on_error: true
 
 
-              # 2) Forecast data present BUT below threshold → CLEAR alert
+              # 2) Forecast data present BUT no alert is active → CLEAR alert
               - conditions:
                   - condition: template
                     value_template: >
-                      {{ (hourly | length > 0) and (matching_count | int < min_matching_hours | int) }}
+                      {{ (hourly | length > 0) and not (weather_alert_active or temp_alert_active) }}
                 sequence:
                   - action: input_boolean.turn_off
                     target:
